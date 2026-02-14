@@ -16,8 +16,14 @@ sealed class CpsFunction(val arg: Int) {
     abstract fun subArg(x: Int, l: CpsFunction): CpsFunction
 }
 
-abstract class Term(arg: Int) : CpsFunction(arg)
+abstract class Term(arg: Int) : CpsFunction(arg) {
+    override fun emit(asExpr: Boolean): String {
+        require(asExpr)
+        return emit()
+    }
 
+    abstract fun emit(): String
+}
 
 class Lambda(arg: Int, val body: CpsFunction) : CpsFunction(arg) {
     override fun emit(asExpr: Boolean): String {
@@ -51,30 +57,24 @@ class NoOp(arg: Int) : CpsFunction(arg) {
 
 
 class Arg(arg: Int) : Term(arg) {
-    override fun emit(asExpr: Boolean): String {
-        require(asExpr)
-        return "arg$arg"
-    }
+    override fun emit(): String = "arg$arg"
 
     override fun then(func: CpsFunction) = func
-
-    override fun subArg(x: Int, l: CpsFunction) = if (x == arg) l else this
 
     override fun subCont(k: Lambda) = if (k.arg == arg) {
         k
     } else {
         k.subArg(k.arg, this)
     }
+
+    override fun subArg(x: Int, l: CpsFunction) = if (x == arg) l else this
 }
 
 class Atom(
     id: Int,
     val content: String,
 ) : Term(id) {
-    override fun emit(asExpr: Boolean): String {
-        require(asExpr)
-        return content
-    }
+    override fun emit(): String = content
 
     override fun then(func: CpsFunction) = func
 
@@ -91,7 +91,7 @@ class If(
 ) : CpsFunction(arg) {
     override fun emit(asExpr: Boolean): String {
         val ret = """
-            if (${cond.emit(true)}) {
+            if (${cond.emit()}) {
                 ${then.emit(false)}
             } else {
                 ${otherwise.emit(false)}
@@ -119,7 +119,7 @@ class If(
 }
 
 class Return(arg: Int, val ret: Term) : CpsFunction(arg) {
-    override fun emit(asExpr: Boolean): String = "k.accept(${ret.emit(true)})" + if (asExpr) {
+    override fun emit(asExpr: Boolean): String = "k.accept(${ret.emit()})" + if (asExpr) {
         ""
     } else {
         ";"
@@ -143,7 +143,7 @@ class Return(arg: Int, val ret: Term) : CpsFunction(arg) {
 class Call(arg: Int, val name: String, val params: List<Term>, val then: CpsFunction) : CpsFunction(arg) {
     override fun emit(asExpr: Boolean): String {
         val paramsString = params.joinToString("") {
-            it.emit(true) + ", "
+            it.emit() + ", "
         }
         val name = if (name == "println") "Prelude.$name" else name
 
@@ -151,6 +151,12 @@ class Call(arg: Int, val name: String, val params: List<Term>, val then: CpsFunc
     }
 
     override fun then(func: CpsFunction) = Call(arg, name, params, then.then(func))
+
+    override fun subCont(k: Lambda) = if (then is NoOp) {
+        Call(arg, name, params, k.body.subArg(k.arg, Arg(arg)))
+    } else {
+        Call(arg, name, params, then.subCont(k))
+    }
 
     override fun subArg(x: Int, l: CpsFunction): CpsFunction {
         val paramFunctions = mutableListOf<CpsFunction>()
@@ -168,21 +174,14 @@ class Call(arg: Int, val name: String, val params: List<Term>, val then: CpsFunc
             param.subCont(Lambda(param.arg, base))
         }
     }
-
-    override fun subCont(k: Lambda) = if (then is NoOp) {
-        Call(arg, name, params, k.body.subArg(k.arg, Arg(arg)))
-    } else {
-        Call(arg, name, params, then.subCont(k))
-    }
 }
 
 class BinOp(arg: Int, val lhs: Term, val op: String, val rhs: Term) : Term(arg) {
-    override fun emit(asExpr: Boolean): String {
-        require(asExpr)
-        return "(${lhs.emit(true)} $op ${rhs.emit(true)})"
-    }
+    override fun emit(): String = "(${lhs.emit()} $op ${rhs.emit()})"
 
     override fun then(func: CpsFunction) = func
+
+    override fun subCont(k: Lambda) = k.subArg(k.arg, this)
 
     override fun subArg(x: Int, l: CpsFunction): CpsFunction {
         val lhs = lhs.subArg(x, l)
@@ -210,17 +209,14 @@ class BinOp(arg: Int, val lhs: Term, val op: String, val rhs: Term) : Term(arg) 
             }
         }
     }
-
-    override fun subCont(k: Lambda) = k.subArg(k.arg, this)
 }
 
 class UnOp(arg: Int, val op: String, val operand: Term) : Term(arg) {
-    override fun emit(asExpr: Boolean): String {
-        require(asExpr)
-        return "($op${operand.emit(true)})"
-    }
+    override fun emit(): String = "($op${operand.emit()})"
 
     override fun then(func: CpsFunction) = func
+
+    override fun subCont(k: Lambda) = k.subArg(k.arg, this)
 
     override fun subArg(x: Int, l: CpsFunction): CpsFunction {
         val operand = operand.subArg(x, l)
@@ -231,8 +227,6 @@ class UnOp(arg: Int, val op: String, val operand: Term) : Term(arg) {
             operand.subCont(Lambda(operand.arg, UnOp(arg, op, Arg(operand.arg))))
         }
     }
-
-    override fun subCont(k: Lambda) = k.subArg(k.arg, this)
 }
 
 data class Binding(val type: String?, val name: String, val value: Term)
@@ -244,7 +238,7 @@ class LetAssign(arg: Int, val bindings: List<Binding>, val then: CpsFunction) : 
         val body = """
             ${
             bindings.joinToString("") {
-                it.type.orEmpty() + " ${it.name} = ${it.value.emit(true)};"
+                it.type.orEmpty() + " ${it.name} = ${it.value.emit()};"
             }
         }
             ${then.emit(false)}
@@ -284,7 +278,7 @@ class LetAssign(arg: Int, val bindings: List<Binding>, val then: CpsFunction) : 
 // Helper for while loops
 class Continue(arg: Int) : CpsFunction(arg) {
     override fun emit(asExpr: Boolean) =
-        "(loopCon$arg as Continuation<Object>).accept(loopCon$arg)" + if (asExpr) "" else ";"
+        "((Continuation<Object>) loopCon$arg).accept(loopCon$arg)" + if (asExpr) "" else ";"
 
     override fun then(func: CpsFunction) = this
 
@@ -293,18 +287,12 @@ class Continue(arg: Int) : CpsFunction(arg) {
     override fun subArg(x: Int, l: CpsFunction) = this
 }
 
-class While(arg: Int, val cond: Term, repeat: CpsFunction, val then: CpsFunction) : CpsFunction(arg) {
-    val repeat = repeat.then(Continue(arg))
+class While(arg: Int, val cond: CpsFunction, val repeat: CpsFunction, val then: CpsFunction) : CpsFunction(arg) {
+    val loop = cond.subCont(Lambda(cond.arg, If(arg, Arg(cond.arg), repeat.then(Continue(arg)), then)))
 
     override fun emit(asExpr: Boolean): String {
         val body = """
-            Continuation<Object> loop$arg = (loopCon$arg) -> {
-                if (${cond.emit(true)}) {
-                    ${repeat.emit(false)}
-                } else {
-                    ${then.emit(false)}
-                }
-            };
+            Continuation<Object> loop$arg = loopCon$arg -> ${loop.emit(true)};
             loop$arg.accept(loop$arg);
         """.trimIndent()
 
@@ -315,15 +303,7 @@ class While(arg: Int, val cond: Term, repeat: CpsFunction, val then: CpsFunction
 
     override fun subCont(k: Lambda) = While(arg, cond, repeat, then.subCont(k))
 
-    override fun subArg(x: Int, l: CpsFunction): CpsFunction {
-        val cond = cond.subArg(x, l)
-
-        return if (cond is Term) {
-            While(arg, cond, repeat.subArg(x, l), then.subArg(x, l))
-        } else {
-            cond.subCont(Lambda(cond.arg, While(arg, Arg(cond.arg), repeat.subArg(x, l), then.subArg(x, l))))
-        }
-    }
+    override fun subArg(x: Int, l: CpsFunction) = While(arg, cond.subArg(x, l), repeat.subArg(x, l), then.subArg(x, l))
 }
 
 class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
@@ -367,10 +347,10 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
         else -> throw Error("Unknown type ${type.text}")
     }
 
-    fun unop(op: String, operand: CpsFunction) =
+    fun unOp(op: String, operand: CpsFunction) =
         operand.subCont(Lambda(operand.arg, UnOp(expr++, op, Arg(operand.arg))))
 
-    fun binop(lhs: CpsFunction, op: String, rhs: CpsFunction) =
+    fun binOp(lhs: CpsFunction, op: String, rhs: CpsFunction) =
         lhs.subCont(
             Lambda(
                 lhs.arg, rhs.subCont(
@@ -382,135 +362,6 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
     override fun defaultResult() = NoOp(expr++)
 
     override fun aggregateResult(aggregate: CpsFunction, nextResult: CpsFunction) = aggregate.then(nextResult)
-
-    override fun visitIfStatement(ctx: MiniKotlinParser.IfStatementContext): CpsFunction {
-        val cond = visit(ctx.expression())
-        return cond.subCont(
-            Lambda(
-                cond.arg, If(
-                    expr++,
-                    Arg(cond.arg),
-                    visit(ctx.block(0)),
-                    ctx.block(1)?.let { visit(it) } ?: NoOp(expr++)
-                )))
-    }
-
-    override fun visitComparisonExpr(ctx: MiniKotlinParser.ComparisonExprContext): CpsFunction {
-        val lhs = visit(ctx.expression(0))
-        val rhs = visit(ctx.expression(1))
-        val op = when {
-            ctx.GE() != null -> ">="
-            ctx.GT() != null -> ">"
-            ctx.LT() != null -> "<"
-            ctx.LE() != null -> "<="
-            else -> error("Unknown comparison operator ${ctx.expression()}")
-        }
-
-        return binop(lhs, op, rhs)
-    }
-
-    override fun visitMulDivExpr(ctx: MiniKotlinParser.MulDivExprContext): CpsFunction {
-        val lhs = visit(ctx.expression(0))
-        val rhs = visit(ctx.expression(1))
-        val op = when {
-            ctx.MULT() != null -> "*"
-            ctx.DIV() != null -> "/"
-            ctx.MOD() != null -> "%"
-            else -> error("Unknown muldiv operator ${ctx.expression()}")
-        }
-
-        return binop(lhs, op, rhs)
-    }
-
-    override fun visitAddSubExpr(ctx: MiniKotlinParser.AddSubExprContext): CpsFunction {
-        val lhs = visit(ctx.expression(0))
-        val rhs = visit(ctx.expression(1))
-        val op = when {
-            ctx.PLUS() != null -> "+"
-            ctx.MINUS() != null -> "-"
-            else -> error("Unknown addsub operator ${ctx.expression()}")
-        }
-
-        return binop(lhs, op, rhs)
-    }
-
-    override fun visitEqualityExpr(ctx: MiniKotlinParser.EqualityExprContext): CpsFunction {
-        val lhs = visit(ctx.expression(0))
-        val rhs = visit(ctx.expression(1))
-        val op = when {
-            ctx.EQ() != null -> "=="
-            ctx.NEQ() != null -> "!="
-            else -> error("Unknown equality operator ${ctx.expression()}")
-        }
-
-        return binop(lhs, op, rhs)
-    }
-
-    override fun visitAndExpr(ctx: MiniKotlinParser.AndExprContext): CpsFunction {
-        val lhs = visit(ctx.expression(0))
-        val rhs = visit(ctx.expression(1))
-
-        return lhs.subCont(
-            Lambda(
-                lhs.arg,
-                LetAssign(
-                    expr++,
-                    listOf(Binding("Boolean", "tmp${lhs.arg}", Arg(lhs.arg))),
-                    If(expr++, Atom(expr++, "tmp${lhs.arg}"), rhs, Atom(expr++, "tmp${lhs.arg}"))
-                )
-            )
-        )
-    }
-
-    override fun visitOrExpr(ctx: MiniKotlinParser.OrExprContext): CpsFunction {
-        val lhs = visit(ctx.expression(0))
-        val rhs = visit(ctx.expression(1))
-
-        return lhs.subCont(
-            Lambda(
-                lhs.arg,
-                LetAssign(
-                    expr++,
-                    listOf(Binding("Boolean", "tmp${lhs.arg}", Arg(lhs.arg))),
-                    If(expr++, Atom(expr++, "tmp${lhs.arg}"), Atom(expr++, "tmp${lhs.arg}"), rhs)
-                )
-            )
-        )
-    }
-
-    override fun visitNotExpr(ctx: MiniKotlinParser.NotExprContext): CpsFunction {
-        val operand = visit(ctx.expression())
-
-        return unop("!", operand)
-    }
-
-    override fun visitIntLiteral(ctx: MiniKotlinParser.IntLiteralContext) = Atom(expr++, ctx.text)
-
-    override fun visitBoolLiteral(ctx: MiniKotlinParser.BoolLiteralContext) = Atom(expr++, ctx.text)
-
-    override fun visitStringLiteral(ctx: MiniKotlinParser.StringLiteralContext) = Atom(expr++, ctx.text)
-
-    override fun visitIdentifierExpr(ctx: MiniKotlinParser.IdentifierExprContext) = Atom(expr++, "var_${ctx.text}")
-
-    override fun visitReturnStatement(ctx: MiniKotlinParser.ReturnStatementContext): CpsFunction {
-        val ret = visit(ctx.expression())
-
-        return ret.subCont(Lambda(ret.arg, Return(expr++, Arg(ret.arg))))
-    }
-
-    override fun visitFunctionCallExpr(ctx: MiniKotlinParser.FunctionCallExprContext): CpsFunction {
-        val paramFunctions = mutableListOf<CpsFunction>()
-        val params = ctx.argumentList()?.expression().orEmpty().map {
-            val v = visit(it)
-            paramFunctions.add(v)
-            Arg(v.arg)
-        }
-
-        val base = Call(expr++, ctx.IDENTIFIER().text, params, NoOp(expr++))
-        return paramFunctions.foldRight(base) { param, base: CpsFunction ->
-            param.subCont(Lambda(param.arg, base))
-        }
-    }
 
     override fun visitVariableDeclaration(ctx: MiniKotlinParser.VariableDeclarationContext): CpsFunction {
         val value = visit(ctx.expression())
@@ -540,10 +391,135 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
         )
     }
 
-    override fun visitWhileStatement(ctx: MiniKotlinParser.WhileStatementContext): CpsFunction {
+    override fun visitIfStatement(ctx: MiniKotlinParser.IfStatementContext): CpsFunction {
         val cond = visit(ctx.expression())
-        val repeat = visit(ctx.block())
-
-        return cond.subCont(Lambda(cond.arg, While(expr++, Arg(cond.arg), repeat, NoOp(expr++))))
+        return cond.subCont(
+            Lambda(
+                cond.arg, If(
+                    expr++,
+                    Arg(cond.arg),
+                    visit(ctx.block(0)),
+                    ctx.block(1)?.let { visit(it) } ?: NoOp(expr++)
+                )))
     }
+
+    override fun visitWhileStatement(ctx: MiniKotlinParser.WhileStatementContext) =
+        While(expr++, visit(ctx.expression()), visit(ctx.block()), NoOp(expr++))
+
+    override fun visitReturnStatement(ctx: MiniKotlinParser.ReturnStatementContext): CpsFunction {
+        val ret = visit(ctx.expression())
+
+        return ret.subCont(Lambda(ret.arg, Return(expr++, Arg(ret.arg))))
+    }
+
+    override fun visitAndExpr(ctx: MiniKotlinParser.AndExprContext): CpsFunction {
+        val lhs = visit(ctx.expression(0))
+        val rhs = visit(ctx.expression(1))
+
+        return lhs.subCont(
+            Lambda(
+                lhs.arg,
+                LetAssign(
+                    expr++,
+                    listOf(Binding("Boolean", "tmp${lhs.arg}", Arg(lhs.arg))),
+                    If(expr++, Atom(expr++, "tmp${lhs.arg}"), rhs, Atom(expr++, "tmp${lhs.arg}"))
+                )
+            )
+        )
+    }
+
+    override fun visitFunctionCallExpr(ctx: MiniKotlinParser.FunctionCallExprContext): CpsFunction {
+        val paramFunctions = mutableListOf<CpsFunction>()
+        val params = ctx.argumentList()?.expression().orEmpty().map {
+            val v = visit(it)
+            paramFunctions.add(v)
+            Arg(v.arg)
+        }
+
+        val base = Call(expr++, ctx.IDENTIFIER().text, params, NoOp(expr++))
+        return paramFunctions.foldRight(base) { param, base: CpsFunction ->
+            param.subCont(Lambda(param.arg, base))
+        }
+    }
+
+    override fun visitMulDivExpr(ctx: MiniKotlinParser.MulDivExprContext): CpsFunction {
+        val lhs = visit(ctx.expression(0))
+        val rhs = visit(ctx.expression(1))
+        val op = when {
+            ctx.MULT() != null -> "*"
+            ctx.DIV() != null -> "/"
+            ctx.MOD() != null -> "%"
+            else -> error("Unknown muldiv operator ${ctx.expression()}")
+        }
+
+        return binOp(lhs, op, rhs)
+    }
+
+    override fun visitOrExpr(ctx: MiniKotlinParser.OrExprContext): CpsFunction {
+        val lhs = visit(ctx.expression(0))
+        val rhs = visit(ctx.expression(1))
+
+        return lhs.subCont(
+            Lambda(
+                lhs.arg,
+                LetAssign(
+                    expr++,
+                    listOf(Binding("Boolean", "tmp${lhs.arg}", Arg(lhs.arg))),
+                    If(expr++, Atom(expr++, "tmp${lhs.arg}"), Atom(expr++, "tmp${lhs.arg}"), rhs)
+                )
+            )
+        )
+    }
+
+    override fun visitEqualityExpr(ctx: MiniKotlinParser.EqualityExprContext): CpsFunction {
+        val lhs = visit(ctx.expression(0))
+        val rhs = visit(ctx.expression(1))
+        val op = when {
+            ctx.EQ() != null -> "=="
+            ctx.NEQ() != null -> "!="
+            else -> error("Unknown equality operator ${ctx.expression()}")
+        }
+
+        return binOp(lhs, op, rhs)
+    }
+
+    override fun visitComparisonExpr(ctx: MiniKotlinParser.ComparisonExprContext): CpsFunction {
+        val lhs = visit(ctx.expression(0))
+        val rhs = visit(ctx.expression(1))
+        val op = when {
+            ctx.GE() != null -> ">="
+            ctx.GT() != null -> ">"
+            ctx.LT() != null -> "<"
+            ctx.LE() != null -> "<="
+            else -> error("Unknown comparison operator ${ctx.expression()}")
+        }
+
+        return binOp(lhs, op, rhs)
+    }
+
+    override fun visitAddSubExpr(ctx: MiniKotlinParser.AddSubExprContext): CpsFunction {
+        val lhs = visit(ctx.expression(0))
+        val rhs = visit(ctx.expression(1))
+        val op = when {
+            ctx.PLUS() != null -> "+"
+            ctx.MINUS() != null -> "-"
+            else -> error("Unknown addsub operator ${ctx.expression()}")
+        }
+
+        return binOp(lhs, op, rhs)
+    }
+
+    override fun visitNotExpr(ctx: MiniKotlinParser.NotExprContext): CpsFunction {
+        val operand = visit(ctx.expression())
+
+        return unOp("!", operand)
+    }
+
+    override fun visitIntLiteral(ctx: MiniKotlinParser.IntLiteralContext) = Atom(expr++, ctx.text)
+
+    override fun visitBoolLiteral(ctx: MiniKotlinParser.BoolLiteralContext) = Atom(expr++, ctx.text)
+
+    override fun visitStringLiteral(ctx: MiniKotlinParser.StringLiteralContext) = Atom(expr++, ctx.text)
+
+    override fun visitIdentifierExpr(ctx: MiniKotlinParser.IdentifierExprContext) = Atom(expr++, "var_${ctx.text}")
 }

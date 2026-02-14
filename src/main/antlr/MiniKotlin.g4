@@ -59,7 +59,7 @@ returnStatement
     ;
 
 expression
-    : IDENTIFIER LPAREN argumentList RPAREN             # FunctionCallExpr
+    : IDENTIFIER LPAREN argumentList? RPAREN             # FunctionCallExpr
     | primary                                           # PrimaryExpr
     | NOT expression                                    # NotExpr
     | expression (MULT | DIV | MOD) expression          # MulDivExpr
