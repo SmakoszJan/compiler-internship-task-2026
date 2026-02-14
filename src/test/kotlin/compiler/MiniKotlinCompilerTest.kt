@@ -53,6 +53,7 @@ class MiniKotlinCompilerTest {
 
         val javaFile = tempDir.resolve("MiniProgram.java")
         Files.writeString(javaFile, javaCode)
+        Files.writeString(Path.of("MiniProgram.java"), javaCode)
 
         val javaCompiler = JavaRuntimeCompiler()
         val stdlibPath = resolveStdlibPath()
