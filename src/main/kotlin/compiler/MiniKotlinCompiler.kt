@@ -25,7 +25,7 @@ abstract class Term(arg: Int) : CpsFunction(arg) {
     abstract fun emit(): String
 }
 
-class Lambda(arg: Int, val body: CpsFunction) : CpsFunction(arg) {
+open class Lambda(arg: Int, val body: CpsFunction) : CpsFunction(arg) {
     override fun emit(asExpr: Boolean): String {
         require(asExpr)
         return "arg$arg -> ${body.emit(true)}"
@@ -50,7 +50,7 @@ class NoOp(arg: Int) : CpsFunction(arg) {
 
     override fun then(func: CpsFunction) = func
 
-    override fun subCont(k: Lambda) = k
+    override fun subCont(k: Lambda) = k.body
 
     override fun subArg(x: Int, l: CpsFunction) = this
 }
@@ -119,7 +119,7 @@ class If(
 }
 
 class Return(arg: Int, val ret: Term) : CpsFunction(arg) {
-    override fun emit(asExpr: Boolean): String = "k.accept(${ret.emit()})" + if (asExpr) {
+    override fun emit(asExpr: Boolean): String = $$"$k.accept($${ret.emit()})" + if (asExpr) {
         ""
     } else {
         ";"
@@ -152,11 +152,7 @@ class Call(arg: Int, val name: String, val params: List<Term>, val then: CpsFunc
 
     override fun then(func: CpsFunction) = Call(arg, name, params, then.then(func))
 
-    override fun subCont(k: Lambda) = if (then is NoOp) {
-        Call(arg, name, params, k.body.subArg(k.arg, Arg(arg)))
-    } else {
-        Call(arg, name, params, then.subCont(k))
-    }
+    override fun subCont(k: Lambda) = Call(arg, name, params, then.subCont(k))
 
     override fun subArg(x: Int, l: CpsFunction): CpsFunction {
         val paramFunctions = mutableListOf<CpsFunction>()
@@ -229,16 +225,16 @@ class UnOp(arg: Int, val op: String, val operand: Term) : Term(arg) {
     }
 }
 
-data class Binding(val type: String?, val name: String, val value: Term)
+data class Binding(val id: Int, val value: Term)
 
 // I'm not really sure if it's legal in CPS, but let bindings and assignments get treated the same
 // and are allowed in sequence
-class LetAssign(arg: Int, val bindings: List<Binding>, val then: CpsFunction) : CpsFunction(arg) {
+class Assign(arg: Int, val bindings: List<Binding>, val then: CpsFunction) : CpsFunction(arg) {
     override fun emit(asExpr: Boolean): String {
         val body = """
             ${
             bindings.joinToString("") {
-                it.type.orEmpty() + " ${it.name} = ${it.value.emit()};"
+                $$"$state.var$${it.id} = $${it.value.emit()};"
             }
         }
             ${then.emit(false)}
@@ -248,37 +244,38 @@ class LetAssign(arg: Int, val bindings: List<Binding>, val then: CpsFunction) : 
     }
 
     override fun then(func: CpsFunction) =
-        if (func is LetAssign && then is NoOp) {
-            LetAssign(arg, bindings + func.bindings, func.then)
+        if (func is Assign && then is NoOp) {
+            Assign(arg, bindings + func.bindings, func.then)
         } else {
-            LetAssign(arg, bindings, then.then(func))
+            Assign(arg, bindings, then.then(func))
         }
 
-    override fun subCont(k: Lambda) = LetAssign(arg, bindings, then.subCont(k))
+    override fun subCont(k: Lambda) = Assign(arg, bindings, then.subCont(k))
 
     override fun subArg(x: Int, l: CpsFunction): CpsFunction {
         val bindingFunctions = mutableListOf<CpsFunction>()
         val newBindings = bindings.map {
             val value = it.value.subArg(x, l)
             if (value is Term) {
-                Binding(it.type, it.name, value)
+                Binding(it.id, value)
             } else {
                 bindingFunctions.add(value)
-                Binding(it.type, it.name, Arg(value.arg))
+                Binding(it.id, Arg(value.arg))
             }
         }
 
-        val base = LetAssign(arg, newBindings, then.subArg(x, l))
+        val base = Assign(arg, newBindings, then.subArg(x, l))
         return bindingFunctions.foldRight(base) { value, base: CpsFunction ->
             value.subCont(Lambda(value.arg, base))
         }
     }
 }
 
+
 // Helper for while loops
 class Continue(arg: Int) : CpsFunction(arg) {
     override fun emit(asExpr: Boolean) =
-        "((Continuation<Object>) loopCon$arg).accept(loopCon$arg)" + if (asExpr) "" else ";"
+        $$"((Continuation<Object>) $loopCon$$arg).accept($loopCon$$arg)" + if (asExpr) "" else ";"
 
     override fun then(func: CpsFunction) = this
 
@@ -291,9 +288,9 @@ class While(arg: Int, val cond: CpsFunction, val repeat: CpsFunction, val then: 
     val loop = cond.subCont(Lambda(cond.arg, If(arg, Arg(cond.arg), repeat.then(Continue(arg)), then)))
 
     override fun emit(asExpr: Boolean): String {
-        val body = """
-            Continuation<Object> loop$arg = loopCon$arg -> ${loop.emit(true)};
-            loop$arg.accept(loop$arg);
+        val body = $$"""
+            Continuation<Object> $loop$$arg = $loopCon$$arg -> $${loop.emit(true)};
+            $loop$$arg.accept($loop$$arg);
         """.trimIndent()
 
         return if (asExpr) "{$body}" else body
@@ -308,20 +305,47 @@ class While(arg: Int, val cond: CpsFunction, val repeat: CpsFunction, val then: 
 
 class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
     var expr: Int = 0
-
+    var varToId: MutableMap<String, Int> = mutableMapOf()
+    var variables = mutableListOf<String>() // types
 
     fun compile(program: MiniKotlinParser.ProgramContext, className: String = "MiniProgram"): String {
         val functions = program.functionDeclaration().joinToString("") { func ->
+            varToId.clear()
+            variables.clear()
             val name = func.IDENTIFIER().text
             val type = convertType(func.type())
             val params = func.parameterList()?.parameter().orEmpty()
-                .joinToString("") { param -> "${convertType(param.type())} var_${param.IDENTIFIER().text}, " }
+                .joinToString("") { param ->
+                    val type = convertType(param.type())
+                    val id = variables.size
+                    variables.add(type)
+                    varToId[param.IDENTIFIER().text] = id
+                    $$"$$type $param_$${param.IDENTIFIER().text}, "
+                }
             val body = visit(func.block())
                 .then(Return(expr++, Atom(expr++, "null")))
                 .emit(false)
-            """
-                static void $name($params Continuation<$type> k) {
-                    $body
+            val stateFields = variables.withIndex().joinToString("") {
+                $$"$${it.value} var$${it.index} = $${
+                    when (it.value) {
+                        "Boolean" -> "false"
+                        "Integer" -> "0"
+                        "String" -> "\"\""
+                        else -> error("Invalid type ${it.value}")
+                    }
+                };\n"
+            }
+            val paramAssign = func.parameterList()?.parameter().orEmpty().joinToString("") {
+                $$"$state.var$${varToId[it.IDENTIFIER().text]} = $param_$${it.IDENTIFIER().text};\n"
+            }
+            $$"""
+                static void $$name($$params Continuation<$$type> $k) {
+                    var $state = new Object() {
+                        $$stateFields
+                    };
+                    $$paramAssign
+                
+                    $$body
                 }
                 
             """.trimIndent()
@@ -365,14 +389,16 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
 
     override fun visitVariableDeclaration(ctx: MiniKotlinParser.VariableDeclarationContext): CpsFunction {
         val value = visit(ctx.expression())
-        val name = "var_${ctx.IDENTIFIER().text}"
+        val id = variables.size
+        variables.add(convertType(ctx.type()))
+        varToId[ctx.IDENTIFIER().text] = id
 
         return value.subCont(
             Lambda(
                 value.arg,
-                LetAssign(
+                Assign(
                     expr++,
-                    listOf(Binding(convertType(ctx.type()), name, Arg(value.arg))),
+                    listOf(Binding(id, Arg(value.arg))),
                     NoOp(expr++)
                 )
             )
@@ -381,12 +407,11 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
 
     override fun visitVariableAssignment(ctx: MiniKotlinParser.VariableAssignmentContext): CpsFunction {
         val value = visit(ctx.expression())
-        val name = "var_${ctx.IDENTIFIER().text}"
 
         return value.subCont(
             Lambda(
                 value.arg,
-                LetAssign(expr++, listOf(Binding(null, name, Arg(value.arg))), NoOp(expr++))
+                Assign(expr++, listOf(Binding(varToId[ctx.IDENTIFIER().text]!!, Arg(value.arg))), NoOp(expr++))
             )
         )
     }
@@ -407,7 +432,7 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
         While(expr++, visit(ctx.expression()), visit(ctx.block()), NoOp(expr++))
 
     override fun visitReturnStatement(ctx: MiniKotlinParser.ReturnStatementContext): CpsFunction {
-        val ret = visit(ctx.expression())
+        val ret = ctx.expression()?.let { visit(it) } ?: Atom(expr++, "null")
 
         return ret.subCont(Lambda(ret.arg, Return(expr++, Arg(ret.arg))))
     }
@@ -415,14 +440,35 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
     override fun visitAndExpr(ctx: MiniKotlinParser.AndExprContext): CpsFunction {
         val lhs = visit(ctx.expression(0))
         val rhs = visit(ctx.expression(1))
+        val id = variables.size
+        variables.add("Boolean")
 
         return lhs.subCont(
             Lambda(
                 lhs.arg,
-                LetAssign(
+                Assign(
                     expr++,
-                    listOf(Binding("Boolean", "tmp${lhs.arg}", Arg(lhs.arg))),
-                    If(expr++, Atom(expr++, "tmp${lhs.arg}"), rhs, Atom(expr++, "tmp${lhs.arg}"))
+                    listOf(Binding(id, Arg(lhs.arg))),
+                    If(expr++, Atom(expr++, $$"$state.var$$id"), rhs, Atom(expr++, $$"$state.var$$id"))
+                )
+            )
+        )
+    }
+
+    override fun visitOrExpr(ctx: MiniKotlinParser.OrExprContext): CpsFunction {
+        val lhs = visit(ctx.expression(0))
+        println("lhs = ${lhs.emit(true)}")
+        val rhs = visit(ctx.expression(1))
+        val id = variables.size
+        variables.add("Boolean")
+
+        return lhs.subCont(
+            Lambda(
+                lhs.arg,
+                Assign(
+                    expr++,
+                    listOf(Binding(id, Arg(lhs.arg))),
+                    If(expr++, Atom(expr++, $$"$state.var$$id"), Atom(expr++, $$"$state.var$$id"), rhs)
                 )
             )
         )
@@ -453,22 +499,6 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
         }
 
         return binOp(lhs, op, rhs)
-    }
-
-    override fun visitOrExpr(ctx: MiniKotlinParser.OrExprContext): CpsFunction {
-        val lhs = visit(ctx.expression(0))
-        val rhs = visit(ctx.expression(1))
-
-        return lhs.subCont(
-            Lambda(
-                lhs.arg,
-                LetAssign(
-                    expr++,
-                    listOf(Binding("Boolean", "tmp${lhs.arg}", Arg(lhs.arg))),
-                    If(expr++, Atom(expr++, "tmp${lhs.arg}"), Atom(expr++, "tmp${lhs.arg}"), rhs)
-                )
-            )
-        )
     }
 
     override fun visitEqualityExpr(ctx: MiniKotlinParser.EqualityExprContext): CpsFunction {
@@ -521,5 +551,5 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<CpsFunction>() {
 
     override fun visitStringLiteral(ctx: MiniKotlinParser.StringLiteralContext) = Atom(expr++, ctx.text)
 
-    override fun visitIdentifierExpr(ctx: MiniKotlinParser.IdentifierExprContext) = Atom(expr++, "var_${ctx.text}")
+    override fun visitIdentifierExpr(ctx: MiniKotlinParser.IdentifierExprContext) = Atom(expr++, $$"$state.var$${varToId[ctx.text]}")
 }
